@@ -17,7 +17,11 @@ from remash.perception.ui import UIDetector, UIState
 from remash.utils.logging import EpisodeLogger, logger
 from remash.world_model.base import WorldModel
 from remash.world_model.graph_model import GraphWorldModel
-from remash.world_model.neural_model import NeuralWorldModel
+
+try:
+    from remash.world_model.neural_model import NeuralWorldModel
+except ImportError:
+    NeuralWorldModel = None  # torch/ncps not installed
 
 if TYPE_CHECKING:
     from remash.perception.objects import GridObject
@@ -274,7 +278,7 @@ class ReMashAgent:
             graph.ensure_node(state_hash)
 
             # Cache frame for neural world model training
-            if isinstance(world_model, NeuralWorldModel):
+            if NeuralWorldModel is not None and isinstance(world_model, NeuralWorldModel):
                 world_model.cache_frame(state_hash, frame.grid)
 
             # Check game state from observation
@@ -362,9 +366,9 @@ class ReMashAgent:
             )
             new_state_hash = frame.game_hash(new_ui.ui_region_mask)
             # Cache new frame BEFORE update so the replay buffer can pair them
-            if isinstance(world_model, NeuralWorldModel):
+            if NeuralWorldModel is not None and isinstance(world_model, NeuralWorldModel):
                 world_model.cache_frame(new_state_hash, frame.grid)
-            if isinstance(world_model, NeuralWorldModel):
+            if NeuralWorldModel is not None and isinstance(world_model, NeuralWorldModel):
                 world_model.update(prev_state_hash, action, new_state_hash, diff, click_xy=click_target)
             else:
                 world_model.update(prev_state_hash, action, new_state_hash, diff)
@@ -388,7 +392,7 @@ class ReMashAgent:
             if new_ui and new_ui.shape_display_hash is not None:
                 shape_str = f" sh:{new_ui.shape_display_hash:016x}"[:8]
             nn_str = ""
-            if isinstance(world_model, NeuralWorldModel) and world_model.avg_loss > 0:
+            if NeuralWorldModel is not None and isinstance(world_model, NeuralWorldModel) and world_model.avg_loss > 0:
                 nn_str = f" loss:{world_model.avg_loss:.4f}"
             print(
                 f"Step {total_steps:3d} | #{h_from}→#{h_to}"
