@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+dist/
+.venv/
+.ruff_cache/
+.pytest_cache/
+logs/
+environment_files/
+recordings/
+uv.lock
