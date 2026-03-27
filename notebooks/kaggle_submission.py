@@ -15,14 +15,11 @@ subprocess.check_call([
 ])
 
 # --- Run agent ---
-import json
 import logging
 import time
 
 import arc_agi
-from arcengine import GameAction, GameState, FrameDataRaw
-
-import numpy as np
+from arcengine import GameAction, GameState
 
 # Import our agent components
 from remash.perception.frame import Frame

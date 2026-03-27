@@ -34,7 +34,6 @@ from remash.policy.base import Policy
 from remash.policy.explorer import ExplorerPolicy
 from remash.policy.spatial import SpatialTracker
 from remash.utils.logging import logger
-from remash.world_model.neural_model import NeuralWorldModel
 
 if TYPE_CHECKING:
     import numpy as np
@@ -104,7 +103,11 @@ class EFEPolicy(Policy):
         self._level_steps += 1
 
         # Check if neural model has enough data
-        neural = isinstance(world_model, NeuralWorldModel)
+        try:
+            from remash.world_model.neural_model import NeuralWorldModel
+            neural = isinstance(world_model, NeuralWorldModel)
+        except ImportError:
+            neural = False
         has_enough_data = neural and len(world_model.replay) >= MIN_NEURAL_TRANSITIONS
 
         if not has_enough_data:
@@ -258,7 +261,7 @@ class EFEPolicy(Policy):
         self,
         state_hash: int,
         objects: list[GridObject],
-        world_model: NeuralWorldModel,
+        world_model: WorldModel,
         graph: StateGraph,
         ui_state: UIState | None,
     ) -> GameAction:
