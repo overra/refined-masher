@@ -1,6 +1,6 @@
 [project]
 name = "remash"
-version = "0.2.0"
+version = "0.3.0"
 description = "Refined Masher - ARC-AGI-3 interactive reasoning agent"
 requires-python = ">=3.11"
 dependencies = [
@@ -14,5 +14,5 @@ dev = ["pytest", "ruff"]
 neural = ["torch", "ncps"]
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
