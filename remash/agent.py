@@ -229,8 +229,13 @@ class ReMashAgent:
         self.max_total_steps = max_total_steps
         self.use_neural = use_neural
 
-    def play_game(self, env, game_id: str = "") -> GameResult:
-        """Play a full game (all levels) using the given environment."""
+    def play_game(self, env, game_id: str = "", competition_mode: bool = False) -> GameResult:
+        """Play a full game (all levels) using the given environment.
+
+        If competition_mode=True, GAME_OVER triggers RESET and continued play
+        (matching competition behavior where the agent gets multiple lives).
+        Graph, world model, and cross-level memory persist across lives.
+        """
         episode_logger = EpisodeLogger(game_id)
 
         # Reset environment
@@ -321,11 +326,31 @@ class ReMashAgent:
                     break
 
             if obs.state == GameState.GAME_OVER:
-                # Game failed
                 logger.info("Game over at level %d (step %d)", level_num, total_steps)
                 episode_logger.log_game_over(obs.levels_completed, total_steps)
                 level_steps.append(current_level_steps)
-                break
+
+                if not competition_mode:
+                    break
+
+                # Competition mode: RESET and continue playing.
+                # Graph + world model + cross-level memory persist across lives.
+                episode.clear()
+                # Preserve color priors across deaths
+                saved_colors = click_mgr._color_priors.copy() | click_mgr._responsive_colors.copy()
+                click_mgr.clear()
+                if saved_colors:
+                    click_mgr.set_color_priors(saved_colors)
+                ui_detector.reset_energy()
+                current_level_steps = 0
+                prev_frame = None
+
+                # Step with RESET
+                obs = env.step(GameAction.RESET)
+                total_steps += 1
+                frame = Frame.from_raw(obs)
+                self.policy.on_level_start(level_num)
+                continue
 
             # Select action
             action = self.policy.select_action(

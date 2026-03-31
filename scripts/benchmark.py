@@ -1,9 +1,10 @@
 """Run ReMash agent on multiple games and report scores.
 
 Usage:
-    uv run python scripts/benchmark.py                    # baseline on all games
-    uv run python scripts/benchmark.py --efe              # EFE+neural on all games
-    uv run python scripts/benchmark.py --games ls20,ft09  # specific games
+    uv run python scripts/benchmark.py                          # single-life baseline
+    uv run python scripts/benchmark.py --efe                    # EFE policy (Kaggle code path)
+    uv run python scripts/benchmark.py --competition-mode       # multi-life, 2000 action cap
+    uv run python scripts/benchmark.py --games ls20,ft09        # specific games
 """
 
 import argparse
@@ -20,9 +21,12 @@ from remash.utils.logging import setup_logging, logger
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark ReMash agent")
     parser.add_argument("--games", default="", help="Comma-separated game IDs (empty = all)")
-    parser.add_argument("--max-steps", type=int, default=500, help="Max steps per level")
+    parser.add_argument("--max-steps", type=int, default=2000, help="Max total steps per game")
     parser.add_argument("--verbose", "-v", action="store_true")
-    parser.add_argument("--efe", action="store_true", help="Use EFE + neural world model")
+    parser.add_argument("--efe", action="store_true", help="Use EFE policy (matches Kaggle code path)")
+    parser.add_argument("--competition-mode", action="store_true",
+                        help="Multi-life mode: GAME_OVER triggers RESET, not exit. "
+                             "Matches actual competition behavior.")
     args = parser.parse_args()
 
     setup_logging(level=logging.DEBUG if args.verbose else logging.WARNING)
@@ -35,7 +39,10 @@ def main() -> None:
     else:
         game_ids = [e.game_id for e in available]
 
-    print(f"Running {'EFE+neural' if args.efe else 'baseline'} on {len(game_ids)} games...")
+    mode_label = "competition" if args.competition_mode else "single-life"
+    if args.efe:
+        mode_label += "+EFE"
+    print(f"Running {mode_label} on {len(game_ids)} games (max {args.max_steps} steps)...")
     results: list[GameResult] = []
     errors: list[str] = []
     t0 = time.time()
@@ -49,7 +56,6 @@ def main() -> None:
         if args.efe:
             from remash.policy.efe import EFEPolicy
             policy = EFEPolicy()
-            # Try neural, gracefully fall back to graph (matches Kaggle code path)
             try:
                 from remash.world_model.neural_model import NeuralWorldModel
                 use_neural = True
@@ -60,8 +66,15 @@ def main() -> None:
             use_neural = False
 
         try:
-            agent = ReMashAgent(policy=policy, use_neural=use_neural)
-            result = agent.play_game(env, game_id=game_id)
+            agent = ReMashAgent(
+                policy=policy,
+                use_neural=use_neural,
+                max_total_steps=args.max_steps,
+            )
+            result = agent.play_game(
+                env, game_id=game_id,
+                competition_mode=args.competition_mode,
+            )
             results.append(result)
             marker = "*" if result.levels_completed > 0 else " "
             print(
@@ -96,7 +109,8 @@ def main() -> None:
         avg_score = sum(r.score for r in results) / len(results)
         total_levels = sum(r.levels_completed for r in results)
         total_possible = sum(r.win_levels for r in results)
-        print(f"{'TOTAL':<20} {total_levels}/{total_possible:>7} {'':>8} {avg_score:>7.1%}")
+        total_steps = sum(r.total_steps for r in results)
+        print(f"{'TOTAL':<20} {total_levels}/{total_possible:>7} {total_steps:>8} {avg_score:>7.1%}")
     print(f"{'='*65}")
     print(f"\nScoring games: {len(scoring)}/{len(results)}")
     print(f"Zero-score games: {len(zero)}/{len(results)}")
