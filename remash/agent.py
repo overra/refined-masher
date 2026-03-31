@@ -19,9 +19,15 @@ from remash.world_model.base import WorldModel
 from remash.world_model.graph_model import GraphWorldModel
 
 try:
+    from remash.world_model.ensemble_model import EnsembleWorldModel
+except ImportError:
+    EnsembleWorldModel = None  # torch not installed
+
+# Legacy import for backward compat
+try:
     from remash.world_model.neural_model import NeuralWorldModel
 except ImportError:
-    NeuralWorldModel = None  # torch/ncps not installed
+    NeuralWorldModel = None
 
 if TYPE_CHECKING:
     from remash.perception.objects import GridObject
@@ -253,8 +259,11 @@ class ReMashAgent:
 
         # Initialize components
         graph = StateGraph(available_actions=available_actions)
-        if self.use_neural:
-            world_model: WorldModel = NeuralWorldModel(graph)
+        if self.use_neural and EnsembleWorldModel is not None:
+            world_model: WorldModel = EnsembleWorldModel(graph)
+            logger.info("Using ensemble world model (residual MLP)")
+        elif self.use_neural and NeuralWorldModel is not None:
+            world_model = NeuralWorldModel(graph)
             logger.info("Using neural world model (CfC ensemble)")
         else:
             world_model = GraphWorldModel(graph)
@@ -282,8 +291,8 @@ class ReMashAgent:
             state_hash = frame.game_hash(ui_state.ui_region_mask)
             graph.ensure_node(state_hash)
 
-            # Cache frame for neural world model training
-            if NeuralWorldModel is not None and isinstance(world_model, NeuralWorldModel):
+            # Cache frame for neural/ensemble world model training
+            if hasattr(world_model, 'cache_frame'):
                 world_model.cache_frame(state_hash, frame.grid)
 
             # Check game state from observation
@@ -392,10 +401,14 @@ class ReMashAgent:
             )
             new_state_hash = frame.game_hash(new_ui.ui_region_mask)
             # Cache new frame BEFORE update so the replay buffer can pair them
-            if NeuralWorldModel is not None and isinstance(world_model, NeuralWorldModel):
+            if hasattr(world_model, 'cache_frame'):
                 world_model.cache_frame(new_state_hash, frame.grid)
-            if NeuralWorldModel is not None and isinstance(world_model, NeuralWorldModel):
-                world_model.update(prev_state_hash, action, new_state_hash, diff, click_xy=click_target)
+            # Update world model — pass click_xy if supported
+            if hasattr(world_model, 'update') and click_target is not None:
+                try:
+                    world_model.update(prev_state_hash, action, new_state_hash, diff, click_xy=click_target)
+                except TypeError:
+                    world_model.update(prev_state_hash, action, new_state_hash, diff)
             else:
                 world_model.update(prev_state_hash, action, new_state_hash, diff)
 
@@ -418,7 +431,7 @@ class ReMashAgent:
             if new_ui and new_ui.shape_display_hash is not None:
                 shape_str = f" sh:{new_ui.shape_display_hash:016x}"[:8]
             nn_str = ""
-            if NeuralWorldModel is not None and isinstance(world_model, NeuralWorldModel) and world_model.avg_loss > 0:
+            if hasattr(world_model, 'avg_loss') and world_model.avg_loss > 0:
                 nn_str = f" loss:{world_model.avg_loss:.4f}"
             print(
                 f"Step {total_steps:3d} | #{h_from}→#{h_to}"

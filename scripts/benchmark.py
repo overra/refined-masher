@@ -57,7 +57,7 @@ def main() -> None:
             from remash.policy.efe import EFEPolicy
             policy = EFEPolicy()
             try:
-                from remash.world_model.neural_model import NeuralWorldModel
+                from remash.world_model.ensemble_model import EnsembleWorldModel
                 use_neural = True
             except ImportError:
                 use_neural = False
