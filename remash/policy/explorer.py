@@ -99,11 +99,20 @@ class ExplorerPolicy(Policy):
         self._toggle_shape_hashes: set[int] = set()
         self._toggle_stale_count: int = 0
         self._toggle_active: bool = False
+        self._toggle_pair: tuple[int, int, GameAction | None, GameAction | None] | None = None
+        # Toggle-goal: track attempts to avoid infinite loops
+        self._toggle_unblock_attempts: int = 0
+        self._toggle_unblock_max: int = 3
+        self._toggle_unblock_failed: bool = False
         # Room commitment: after crossing a doorway, stay for N steps
         self._room_commit_remaining: int = 0
         self._room_entry_state: int | None = None
         self._last_state_hash: int | None = None
         self._last_diff_pixels: int = 0
+        # Stuck detection
+        self._known_states: set[int] = set()
+        self._steps_since_new_state: int = 0
+        self._stuck_resets: int = 0
 
     def on_level_start(self, level_num: int) -> None:
         self._level_steps = 0
@@ -125,10 +134,16 @@ class ExplorerPolicy(Policy):
         self._toggle_shape_hashes.clear()
         self._toggle_stale_count = 0
         self._toggle_active = False
+        self._toggle_pair = None
+        self._toggle_unblock_attempts = 0
+        self._toggle_unblock_failed = False
         self._room_commit_remaining = 0
         self._room_entry_state = None
         self._last_state_hash = None
         self._last_diff_pixels = 0
+        self._known_states.clear()
+        self._steps_since_new_state = 0
+        self._stuck_resets = 0
 
     def on_level_complete(self, level_num: int) -> None:
         pass
@@ -195,6 +210,32 @@ class ExplorerPolicy(Policy):
             if self._mode == "exploit":
                 self._nav_path = None
 
+        # --- Stuck detection ---
+        if state_hash not in self._known_states:
+            self._known_states.add(state_hash)
+            self._steps_since_new_state = 0
+        else:
+            self._steps_since_new_state += 1
+
+        # Escalation when stuck
+        if self._steps_since_new_state >= 15 and self._stuck_resets < 5:
+            if self._steps_since_new_state == 15:
+                # Level 1: clear blocked approaches to re-test them
+                self.spatial._blocked_sides.clear()
+                self._stuck_resets += 1
+                logger.info("Stuck escalation L1: cleared blocked sides (reset %d/5)", self._stuck_resets)
+            elif self._steps_since_new_state == 30:
+                # Level 2: cancel nav path, clear blocked sides again
+                self._nav_path = None
+                self.spatial._blocked_sides.clear()
+                logger.info("Stuck escalation L2: cleared nav + blocked sides")
+            elif self._steps_since_new_state >= 50 and self._steps_since_new_state % 10 == 0:
+                # Level 3: inject random actions to break out of cycles
+                action = random.choice(graph.available_actions)
+                self._record(state_hash, action)
+                self.last_reason = "stuck-random"
+                return action
+
         # --- Priority 1: Win path ---
         if self._win_path and self._win_path_idx < len(self._win_path):
             action = self._win_path[self._win_path_idx]
@@ -232,6 +273,57 @@ class ExplorerPolicy(Policy):
         if toggle_action is not None:
             self._record(state_hash, toggle_action)
             return toggle_action
+
+        # --- Priority 4.5: Toggle-goal unblock ---
+        # If goal is blocked on 2+ sides and we know a toggle pair, try it
+        if (self._toggle_pair is not None
+                and not self._toggle_unblock_failed
+                and self._toggle_unblock_attempts < self._toggle_unblock_max):
+            goal_pos = self._get_primary_goal(objects, ui_state)
+            if goal_pos is not None:
+                blocked_sides = self.spatial.get_blocked_sides(goal_pos)
+                if len(blocked_sides) >= 2:
+                    state_a, state_b, action_a, action_b = self._toggle_pair
+                    # Navigate to toggle start and execute
+                    if state_hash == state_a and action_a:
+                        self._toggle_unblock_attempts += 1
+                        self._record(state_hash, action_a)
+                        self.last_reason = f"toggle-unblock→B(attempt={self._toggle_unblock_attempts})"
+                        # Clear blocked sides to re-test after toggle
+                        self.spatial._blocked_sides.clear()
+                        logger.info("Toggle-unblock: executing toggle to unblock goal (attempt %d/%d)",
+                                    self._toggle_unblock_attempts, self._toggle_unblock_max)
+                        return action_a
+                    elif state_hash == state_b and action_b:
+                        self._toggle_unblock_attempts += 1
+                        self._record(state_hash, action_b)
+                        self.last_reason = f"toggle-unblock→A(attempt={self._toggle_unblock_attempts})"
+                        self.spatial._blocked_sides.clear()
+                        logger.info("Toggle-unblock: executing toggle to unblock goal (attempt %d/%d)",
+                                    self._toggle_unblock_attempts, self._toggle_unblock_max)
+                        return action_b
+                    else:
+                        # Navigate to toggle state
+                        path_to_a = graph.shortest_path(state_hash, state_a) if state_a is not None else None
+                        path_to_b = graph.shortest_path(state_hash, state_b) if state_b is not None else None
+                        best_path = None
+                        if path_to_a and path_to_b:
+                            best_path = path_to_a if len(path_to_a) <= len(path_to_b) else path_to_b
+                        elif path_to_a:
+                            best_path = path_to_a
+                        elif path_to_b:
+                            best_path = path_to_b
+                        if best_path:
+                            self._nav_path = best_path
+                            self._nav_path_idx = 0
+                            action = self._nav_path[self._nav_path_idx]
+                            self._nav_path_idx += 1
+                            self._record(state_hash, action)
+                            self.last_reason = f"nav-to-toggle(dist={len(best_path)})"
+                            return action
+                    if self._toggle_unblock_attempts >= self._toggle_unblock_max:
+                        self._toggle_unblock_failed = True
+                        logger.info("Toggle-unblock: exhausted attempts, marking as failed")
 
         # --- Priority 5: Spatial goal pursuit (only if approach not blocked) ---
         goal_action = self._spatial_goal_action(objects, graph, state_hash, ui_state)
@@ -409,6 +501,7 @@ class ExplorerPolicy(Policy):
         self._toggle_state_b = state_b
         self._toggle_shape_hashes = {shape_hash}
         self._toggle_stale_count = 0
+        self._toggle_pair = (state_a, state_b, None, None)  # updated below
 
         for s, a in recent:
             if s == state_a:
@@ -416,6 +509,7 @@ class ExplorerPolicy(Policy):
             elif s == state_b:
                 self._toggle_return_action = a
 
+        self._toggle_pair = (state_a, state_b, self._toggle_action, self._toggle_return_action)
         logger.info("Toggle: started between %#06x and %#06x", state_a & 0xFFFF, state_b & 0xFFFF)
 
         if state_hash == state_a and self._toggle_action:

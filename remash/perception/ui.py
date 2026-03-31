@@ -47,6 +47,12 @@ _MIN_BAR_LENGTH = 8
 # How many bottom rows to scan for UI elements
 _SCAN_ROWS = 10
 
+# Fallback step budget when energy bar is not detected
+_FALLBACK_ENERGY_BUDGET = 50
+
+# Fallback UI mask: mark bottom N rows as UI when bar detection fails
+_FALLBACK_UI_ROWS = 4
+
 
 def _find_horizontal_runs(row: np.ndarray) -> list[tuple[int, int, int]]:
     """Find all maximal horizontal runs of same color in a row.
@@ -215,9 +221,12 @@ class UIDetector:
         self._initial_lives: int = 0
         # Shape display region: (row_start, row_end, col_start, col_end)
         self._shape_region: tuple[int, int, int, int] | None = None
+        # Step-based energy fallback when bar detection fails
+        self._step_count: int = 0
 
     def detect(self, frame: Frame, prev_frame: Frame | None = None) -> UIState:
         grid = frame.grid
+        self._step_count += 1
 
         # Calibrate on first call
         if not self._calibrated:
@@ -257,12 +266,16 @@ class UIDetector:
     def _detect_energy(self, grid: np.ndarray) -> float | None:
         cfg = self._bar_config
         if cfg is None or self._initial_bar_pixels == 0:
-            return None
+            # Fallback: estimate energy from step count.
+            # Use a cyclical estimate so we don't get stuck in permanent exploit mode.
+            # Each "life" is ~FALLBACK_BUDGET steps; if we survive longer, assume
+            # we got a new life and reset the counter.
+            steps_in_life = self._step_count % _FALLBACK_ENERGY_BUDGET
+            return max(0.05, 1.0 - steps_in_life / _FALLBACK_ENERGY_BUDGET)
 
         current = self._count_bar_pixels(grid)
 
         # Handle death/reset: if bar jumps UP significantly, it's a life reset.
-        # Use the new value as the current bar, but keep initial for fraction.
         if current > self._prev_bar_pixels + 10:
             # Life was lost, bar reset. Update reference but don't change initial.
             pass
@@ -339,16 +352,24 @@ class UIDetector:
         return xxhash.xxh64(region.tobytes()).intdigest()
 
     def _build_ui_mask(self, grid: np.ndarray) -> np.ndarray | None:
+        h, w = grid.shape
         cfg = self._bar_config
         if cfg is None:
-            return None
+            # Fallback: mark bottom rows as UI to prevent UI flicker
+            # from corrupting state hashes
+            mask = np.zeros((h, w), dtype=bool)
+            mask[h - _FALLBACK_UI_ROWS:, :] = True
+            return mask
 
-        h, w = grid.shape
         mask = np.zeros((h, w), dtype=bool)
         min_row = min(cfg.rows)
         # Mark everything from the bar rows to the bottom as UI
         mask[min_row:, :] = True
         return mask
+
+    def reset_energy(self) -> None:
+        """Reset step-based energy counter (call on level complete or game reset)."""
+        self._step_count = 0
 
     def reset(self) -> None:
         """Reset calibration (call on new game or level with different UI)."""
@@ -358,6 +379,7 @@ class UIDetector:
         self._prev_bar_pixels = 0
         self._initial_lives = 0
         self._shape_region = None
+        self._step_count = 0
 
 
 # Module-level convenience for simple usage

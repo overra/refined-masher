@@ -69,6 +69,10 @@ class SpatialTracker:
     def calibrated(self) -> bool:
         return self._calibrated
 
+    def has_direction_info(self) -> bool:
+        """True if we have at least one action→direction mapping."""
+        return len(self.action_dirs) > 0
+
     def cache_state_position(self, state_hash: int) -> None:
         """Call each step so frontier scorer can look up player positions per state."""
         if self.player_centroid is not None:

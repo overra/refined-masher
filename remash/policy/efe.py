@@ -10,14 +10,14 @@ Epistemic value = world_model.get_uncertainty(state, a)
 
 Pragmatic value = predicted magnitude of change (big diff = important event).
     Known transitions: use recorded diff magnitude from graph.
-    Unknown transitions: mild default (encourages exploration).
+    Unknown transitions: strong encouragement (higher than known).
 
-Precision (inverse temperature) scales with model confidence:
-    Low loss → high precision → exploit known good actions.
-    High loss → low precision → broad exploration.
+Precision (inverse temperature) scales with exploration progress and energy:
+    Many untested actions → low precision → explore broadly.
+    Low energy → high precision → exploit known good actions.
 
-Falls back to the graph-based explorer when the neural model has
-insufficient data (< MIN_NEURAL_TRANSITIONS).
+Falls back to the explorer for win-path execution and toggle detection
+(explorer is better at these sequential patterns).
 """
 
 from __future__ import annotations
@@ -25,8 +25,6 @@ from __future__ import annotations
 import math
 import random
 from typing import TYPE_CHECKING
-
-import torch
 
 from arcengine import GameAction
 
@@ -46,24 +44,23 @@ if TYPE_CHECKING:
     from remash.perception.ui import UIState
     from remash.world_model.base import WorldModel
 
-# Minimum replay buffer size before trusting neural uncertainty
-MIN_NEURAL_TRANSITIONS = 20
-
 # Precision bounds
 PRECISION_MIN = 0.5   # very exploratory
 PRECISION_MAX = 10.0  # very exploitative
-PRECISION_LOSS_SCALE = 0.05  # precision = PRECISION_LOSS_SCALE / (avg_loss + eps)
 
 # Pragmatic value scaling
 PRAGMATIC_DIFF_SCALE = 1.0 / 100.0  # normalize diff magnitude to ~0-1 range
+
+# Minimum steps before EFE activates (let explorer calibrate spatial tracker first)
+_MIN_LEVEL_STEPS = 8
 
 
 class EFEPolicy(Policy):
     """Expected Free Energy policy with explorer fallback.
 
-    For click-only games, generates candidates from object centroids and
-    scores each by neural uncertainty. selected_click_target is read by
-    the agent to override the ClickTargetManager.
+    Uses EFE for action selection once the spatial tracker has calibrated.
+    Delegates to Explorer for win-path execution and toggle detection.
+    For click actions, scores candidates by uncertainty + salience.
     """
 
     def __init__(self) -> None:
@@ -102,31 +99,21 @@ class EFEPolicy(Policy):
     ) -> GameAction:
         self._level_steps += 1
 
-        # Check if neural model has enough data
-        try:
-            from remash.world_model.neural_model import NeuralWorldModel
-            neural = isinstance(world_model, NeuralWorldModel)
-        except ImportError:
-            neural = False
-        has_enough_data = neural and len(world_model.replay) >= MIN_NEURAL_TRANSITIONS
-
-        if not has_enough_data:
-            # Fall back to explorer
+        # Let explorer handle the first few steps for spatial calibration
+        if self._level_steps <= _MIN_LEVEL_STEPS:
             self._using_explorer = True
             self._mode = "explore"
             action = self._explorer.select_action(
                 state_hash, frame, objects, ui_state,
                 world_model, episode, graph, cross_level, context,
             )
-            self.last_reason = f"fallback:{self._explorer.last_reason}"
+            self.last_reason = f"calibrate:{self._explorer.last_reason}"
             return action
 
-        # --- EFE action selection ---
-        self._using_explorer = False
-
-        # First check: does the explorer have a win path? Always defer to that.
+        # Always defer to explorer for win paths (it has BFS execution)
         win_path = graph.get_path_to_win(state_hash)
         if win_path:
+            self._using_explorer = False
             self._mode = "efe-win"
             action = self._explorer.select_action(
                 state_hash, frame, objects, ui_state,
@@ -135,28 +122,43 @@ class EFEPolicy(Policy):
             self.last_reason = f"efe-win:{self._explorer.last_reason}"
             return action
 
-        # Compute adaptive precision from model loss
-        avg_loss = world_model.avg_loss if neural else 1.0
-        self._precision = min(
-            PRECISION_MAX,
-            max(PRECISION_MIN, PRECISION_LOSS_SCALE / (avg_loss + 1e-6)),
-        )
+        # Defer to explorer for toggle detection/exploitation
+        if self._explorer._toggle_pair is not None:
+            self._using_explorer = True
+            self._mode = "toggle"
+            action = self._explorer.select_action(
+                state_hash, frame, objects, ui_state,
+                world_model, episode, graph, cross_level, context,
+            )
+            self.last_reason = f"toggle:{self._explorer.last_reason}"
+            return action
 
-        # Compute G(a) for each available action
+        # --- EFE action selection ---
+        self._using_explorer = False
+
+        # Compute adaptive precision from exploration progress and energy
         available = graph.available_actions
         if not available:
             self.last_reason = "efe-no-actions"
             return GameAction.ACTION1
 
-        # Click-only game: let the ClickTargetManager handle target selection
-        # (it has grid fallback and tried-set tracking). EFE just selects ACTION6.
+        energy = ui_state.energy if ui_state else None
+        untested = graph.get_untested_actions(state_hash)
+        tested_frac = 1.0 - len(untested) / max(len(available), 1)
+        # Energy pressure: lower energy → higher precision (exploit more)
+        energy_factor = 1.0 + (1.0 - (energy if energy is not None else 0.5)) * 2.0
+        self._precision = min(
+            PRECISION_MAX,
+            max(PRECISION_MIN, PRECISION_MIN + tested_frac * energy_factor * (PRECISION_MAX - PRECISION_MIN)),
+        )
+
+        # Click-only game: score candidates by uncertainty
         self.selected_click_target = None
         is_click_only = len(available) == 1 and available[0] == GameAction.ACTION6
         if is_click_only:
-            # The ClickTargetManager will pick the actual (x,y)
-            self._mode = "efe-click"
-            self.last_reason = "click-delegate"
-            return GameAction.ACTION6
+            return self._score_click_candidates(
+                state_hash, objects, world_model, graph, ui_state,
+            )
 
         g_values: dict[GameAction, float] = {}
         epistemic_values: dict[GameAction, float] = {}
@@ -166,20 +168,18 @@ class EFEPolicy(Policy):
 
         for action in available:
             # --- Epistemic value ---
-            # Direct: uncertainty of this transition
             direct_epistemic = world_model.get_uncertainty(state_hash, action)
 
-            # Transitive: average uncertainty of actions from the destination state.
-            # "Going somewhere with lots of unknowns teaches us things."
+            # Transitive: average uncertainty of actions from the destination state
             transitive_epistemic = 0.0
             if node and action in node.transitions:
                 dest_hash = node.transitions[action]
                 dest_uncertainties = [
                     world_model.get_uncertainty(dest_hash, a)
-                    for a in graph.available_actions
+                    for a in available
                 ]
                 transitive_epistemic = sum(dest_uncertainties) / len(dest_uncertainties) if dest_uncertainties else 0.0
-                # Also boost destinations with untested actions in the graph
+                # Boost destinations with untested actions
                 untested_count = len(graph.get_untested_actions(dest_hash))
                 transitive_epistemic += untested_count * 0.15
 
@@ -196,25 +196,30 @@ class EFEPolicy(Policy):
                 # Penalize no-change actions
                 if action in node.no_change:
                     pragmatic = -0.5
-                # Visit penalty: reduce pragmatic value for heavily visited destinations
+                # Visit penalty for heavily visited destinations
                 if action in node.transitions:
                     dest_node = graph.nodes.get(node.transitions[action])
                     if dest_node:
                         pragmatic -= dest_node.visit_count * 0.03
             else:
-                # Unknown transition: strong encouragement
-                pragmatic = 0.3
+                # Unknown transition: strong encouragement (higher than known)
+                pragmatic = 0.5
 
             g = -epistemic - pragmatic
             g_values[action] = g
             epistemic_values[action] = epistemic
             pragmatic_values[action] = pragmatic
 
+        # If ACTION6 is available alongside other actions, also score click candidates
+        if GameAction.ACTION6 in available and len(available) > 1:
+            click_epistemic = world_model.get_uncertainty(state_hash, GameAction.ACTION6)
+            # Score click candidates to pick the best target
+            self._pick_best_click(state_hash, objects, world_model, graph, ui_state)
+
         # Softmax selection with precision
         action = self._softmax_sample(g_values, self._precision)
 
-        # Energy-aware mode label
-        energy = ui_state.energy if ui_state else None
+        # Set mode label for logging
         if energy is not None and energy < 0.3:
             self._mode = "efe-low"
         elif energy is not None and energy > 0.7:
@@ -257,6 +262,52 @@ class EFEPolicy(Policy):
                 return action
         return actions[-1]
 
+    def _pick_best_click(
+        self,
+        state_hash: int,
+        objects: list[GridObject],
+        world_model: WorldModel,
+        graph: StateGraph,
+        ui_state: UIState | None,
+    ) -> None:
+        """Pick best click target and set self.selected_click_target."""
+        ui_rows = 10 if ui_state and ui_state.ui_region_mask is not None else None
+        candidates: list[tuple[int, int]] = []
+        areas: list[float] = []
+
+        for obj in sorted(objects, key=lambda o: o.area):
+            if ui_rows is not None and obj.centroid[1] > (64 - ui_rows):
+                continue
+            cx, cy = int(obj.centroid[0]), int(obj.centroid[1])
+            if (cx, cy) not in candidates:
+                candidates.append((cx, cy))
+                areas.append(obj.area)
+            if obj.area >= 4 and len(candidates) < 10:
+                for corner in [(obj.bbox[0], obj.bbox[1]), (obj.bbox[2], obj.bbox[3])]:
+                    if corner not in candidates:
+                        candidates.append(corner)
+                        areas.append(obj.area)
+
+        if not candidates:
+            return
+
+        candidates = candidates[:10]
+        areas = areas[:10]
+
+        # Score by inverse area (smaller = more interesting)
+        best_idx = 0
+        best_score = -999.0
+        for i, ((cx, cy), area) in enumerate(zip(candidates, areas)):
+            pragmatic = max(0.0, 1.0 - area / 200.0)
+            # Use graph uncertainty as a proxy
+            unc = world_model.get_uncertainty(state_hash, GameAction.ACTION6)
+            score = unc + pragmatic * 0.3
+            if score > best_score:
+                best_score = score
+                best_idx = i
+
+        self.selected_click_target = candidates[best_idx]
+
     def _score_click_candidates(
         self,
         state_hash: int,
@@ -265,12 +316,7 @@ class EFEPolicy(Policy):
         graph: StateGraph,
         ui_state: UIState | None,
     ) -> GameAction:
-        """For click-only games: generate click candidates and pick by EFE.
-
-        Generates up to 10 candidates from object centroids and bbox corners.
-        Scores each by neural uncertainty (epistemic) + object salience (pragmatic).
-        """
-        # Generate candidates from objects
+        """For click-only games: generate click candidates and pick by EFE."""
         ui_rows = 10 if ui_state and ui_state.ui_region_mask is not None else None
         candidates: list[tuple[int, int]] = []
         saliences: list[float] = []
@@ -281,15 +327,13 @@ class EFEPolicy(Policy):
             cx, cy = int(obj.centroid[0]), int(obj.centroid[1])
             if (cx, cy) not in candidates:
                 candidates.append((cx, cy))
-                saliences.append(obj.area)  # small objects = low area = high interest
-            # Add bbox corners for larger objects
+                saliences.append(obj.area)
             if obj.area >= 4 and len(candidates) < 10:
                 for corner in [(obj.bbox[0], obj.bbox[1]), (obj.bbox[2], obj.bbox[3])]:
                     if corner not in candidates:
                         candidates.append(corner)
                         saliences.append(obj.area)
 
-        # Add grid samples to fill up to 10 candidates
         if len(candidates) < 10:
             for gy in range(4, 64, 8):
                 for gx in range(4, 64, 8):
@@ -297,7 +341,7 @@ class EFEPolicy(Policy):
                         break
                     if (gx, gy) not in candidates:
                         candidates.append((gx, gy))
-                        saliences.append(200.0)  # large "area" = low salience = grid fallback
+                        saliences.append(200.0)
 
         if not candidates:
             candidates = [(32, 32)]
@@ -306,14 +350,17 @@ class EFEPolicy(Policy):
         candidates = candidates[:10]
         saliences = saliences[:10]
 
-        # Get neural uncertainties in a single batch
-        uncertainties = world_model.get_click_uncertainties(state_hash, candidates)
+        # Try to get batch uncertainties from neural model
+        try:
+            uncertainties = world_model.get_click_uncertainties(state_hash, candidates)
+        except (AttributeError, TypeError):
+            # Graph model doesn't have batch click uncertainties
+            base_unc = world_model.get_uncertainty(state_hash, GameAction.ACTION6)
+            uncertainties = [base_unc] * len(candidates)
 
-        # Score: epistemic (neural uncertainty) + pragmatic (inverse object size)
         best_idx = 0
         best_score = -999.0
         for i, ((cx, cy), unc, area) in enumerate(zip(candidates, uncertainties, saliences)):
-            # Smaller objects = more interesting targets
             pragmatic = max(0.0, 1.0 - area / 200.0)
             score = unc + pragmatic * 0.3
             if score > best_score:

@@ -305,6 +305,7 @@ class ReMashAgent:
                 current_level_steps = 0
                 episode.clear()
                 click_mgr.clear()
+                ui_detector.reset_energy()
                 # Load cross-level color priors for the new level
                 color_priors = cross_level.get_responsive_click_colors()
                 click_mgr.set_color_priors(color_priors)
