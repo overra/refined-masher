@@ -49,7 +49,12 @@ def main() -> None:
         if args.efe:
             from remash.policy.efe import EFEPolicy
             policy = EFEPolicy()
-            use_neural = True
+            # Try neural, gracefully fall back to graph (matches Kaggle code path)
+            try:
+                from remash.world_model.neural_model import NeuralWorldModel
+                use_neural = True
+            except ImportError:
+                use_neural = False
         else:
             policy = ExplorerPolicy(max_steps_per_level=args.max_steps)
             use_neural = False

@@ -99,6 +99,26 @@ class EFEPolicy(Policy):
     ) -> GameAction:
         self._level_steps += 1
 
+        # Check if world model provides continuous uncertainty (neural model)
+        # With binary uncertainty (graph model), Explorer is strictly better —
+        # it has spatial goal pursuit, corridor discovery, toggle detection, etc.
+        try:
+            from remash.world_model.neural_model import NeuralWorldModel
+            has_neural = isinstance(world_model, NeuralWorldModel)
+        except ImportError:
+            has_neural = False
+
+        if not has_neural:
+            # Fall through to Explorer — it's better with binary uncertainty
+            self._using_explorer = True
+            action = self._explorer.select_action(
+                state_hash, frame, objects, ui_state,
+                world_model, episode, graph, cross_level, context,
+            )
+            self._mode = self._explorer._mode
+            self.last_reason = self._explorer.last_reason
+            return action
+
         # Let explorer handle the first few steps for spatial calibration
         if self._level_steps <= _MIN_LEVEL_STEPS:
             self._using_explorer = True
@@ -133,7 +153,7 @@ class EFEPolicy(Policy):
             self.last_reason = f"toggle:{self._explorer.last_reason}"
             return action
 
-        # --- EFE action selection ---
+        # --- EFE action selection (neural model only) ---
         self._using_explorer = False
 
         # Compute adaptive precision from exploration progress and energy
