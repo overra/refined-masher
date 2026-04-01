@@ -148,7 +148,7 @@ class EnsembleWorldModel(WorldModel):
     - Trains online every N steps from replay buffer
     """
 
-    def __init__(self, graph: StateGraph) -> None:
+    def __init__(self, graph: StateGraph, pretrained_path: str | None = None) -> None:
         self.graph = graph
         self.device = torch.device("cpu")
 
@@ -175,6 +175,22 @@ class EnsembleWorldModel(WorldModel):
 
         # Uncertainty normalization: track running max for scaling to [0, 1]
         self._max_uncertainty: float = 0.01  # avoid div by zero
+
+        # Load pre-trained weights if available
+        if pretrained_path is not None:
+            self._load_pretrained(pretrained_path)
+
+    def _load_pretrained(self, path: str) -> None:
+        """Load pre-trained encoder and dynamics weights."""
+        import os
+        if not os.path.exists(path):
+            return
+        ckpt = torch.load(path, map_location=self.device, weights_only=True)
+        if "encoder" in ckpt:
+            self.encoder.load_state_dict(ckpt["encoder"])
+            self.target_encoder.load_state_dict(ckpt["encoder"])
+        if "dynamics" in ckpt:
+            self.dynamics.load_state_dict(ckpt["dynamics"])
 
     def cache_frame(self, state_hash: int, grid: np.ndarray) -> None:
         """Cache a frame grid for later replay buffer use."""

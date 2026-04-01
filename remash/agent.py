@@ -235,12 +235,16 @@ class ReMashAgent:
         self.max_total_steps = max_total_steps
         self.use_neural = use_neural
 
-    def play_game(self, env, game_id: str = "", competition_mode: bool = False) -> GameResult:
+    def play_game(self, env, game_id: str = "", competition_mode: bool = False,
+                   external_world_model: WorldModel | None = None) -> GameResult:
         """Play a full game (all levels) using the given environment.
 
         If competition_mode=True, GAME_OVER triggers RESET and continued play
         (matching competition behavior where the agent gets multiple lives).
         Graph, world model, and cross-level memory persist across lives.
+
+        If external_world_model is provided, use it instead of creating a new one.
+        This allows pre-training to inject a shared world model.
         """
         episode_logger = EpisodeLogger(game_id)
 
@@ -259,8 +263,14 @@ class ReMashAgent:
 
         # Initialize components
         graph = StateGraph(available_actions=available_actions)
-        if self.use_neural and EnsembleWorldModel is not None:
-            world_model: WorldModel = EnsembleWorldModel(graph)
+        if external_world_model is not None:
+            world_model: WorldModel = external_world_model
+            # Inject the graph into the external model if it supports it
+            if hasattr(world_model, 'graph'):
+                world_model.graph = graph
+            logger.info("Using external world model")
+        elif self.use_neural and EnsembleWorldModel is not None:
+            world_model = EnsembleWorldModel(graph)
             logger.info("Using ensemble world model (residual MLP)")
         elif self.use_neural and NeuralWorldModel is not None:
             world_model = NeuralWorldModel(graph)

@@ -10,29 +10,29 @@ Key augmentations:
 Usage:
     uv run python scripts/pretrain.py                      # 100 episodes
     uv run python scripts/pretrain.py --episodes 200       # custom count
-    uv run python scripts/pretrain.py --validate           # benchmark after
+    uv run python scripts/pretrain.py --resume             # resume from checkpoint
 """
 
 import argparse
 import logging
-import os
 import random
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 import arc_agi
 from arcengine import GameAction
 
 from remash.agent import ReMashAgent
 from remash.policy.explorer import ExplorerPolicy
+from remash.memory.state_graph import StateGraph
 from remash.world_model.ensemble_model import (
     EnsembleWorldModel, SpatialEncoder, EnsembleDynamics,
-    LEARNING_RATE, BATCH_SIZE,
+    LEARNING_RATE, TARGET_TAU,
 )
-from remash.memory.state_graph import StateGraph
 from remash.utils.logging import setup_logging, logger
 
 WEIGHTS_DIR = Path("weights")
@@ -42,7 +42,7 @@ CHECKPOINT_PATH = WEIGHTS_DIR / "pretrained.pt"
 HOLDOUT_GAMES = {"ft09", "dc22", "sb26", "r11l", "tn36"}
 
 # Offline rehearsal config
-REHEARSAL_EVERY = 10  # episodes
+REHEARSAL_EVERY = 10
 REHEARSAL_PASSES = 5
 REHEARSAL_BATCH = 32
 
@@ -54,30 +54,15 @@ def make_color_permutation() -> np.ndarray:
     return perm
 
 
-def apply_color_perm(grid: np.ndarray, perm: np.ndarray) -> np.ndarray:
-    """Apply color permutation to a frame grid."""
-    return perm[grid]
-
-
-def make_action_permutation(available: list[GameAction]) -> dict[GameAction, GameAction]:
-    """Random permutation of directional actions (ACTION1-4)."""
-    directional = [a for a in available if a.value in (1, 2, 3, 4)]
-    if len(directional) < 2:
-        return {}  # no permutation for click-only games
-    shuffled = directional.copy()
-    random.shuffle(shuffled)
-    return dict(zip(directional, shuffled))
-
-
-class AugmentedWorldModel(EnsembleWorldModel):
-    """World model wrapper that applies color permutation to frames."""
+class AugmentedEnsembleWorldModel(EnsembleWorldModel):
+    """World model that applies color permutation to cached frames."""
 
     def __init__(self, graph: StateGraph, color_perm: np.ndarray):
         super().__init__(graph)
         self._color_perm = color_perm
 
     def cache_frame(self, state_hash: int, grid: np.ndarray) -> None:
-        augmented = apply_color_perm(grid, self._color_perm)
+        augmented = self._color_perm[grid]
         super().cache_frame(state_hash, augmented)
 
 
@@ -89,17 +74,14 @@ class PersistentReplayBuffer:
         self._max_size = max_size
 
     def extend_from(self, replay) -> int:
-        """Copy transitions from an episode's replay buffer."""
         added = 0
         for item in replay._buffer:
             if len(self._buffer) < self._max_size:
                 self._buffer.append(item)
-                added += 1
             else:
-                # Random replacement
                 idx = random.randint(0, len(self._buffer) - 1)
                 self._buffer[idx] = item
-                added += 1
+            added += 1
         return added
 
     def sample(self, n: int):
@@ -112,21 +94,15 @@ class PersistentReplayBuffer:
 
 def offline_rehearsal(
     encoder: SpatialEncoder,
+    target_encoder: SpatialEncoder,
     dynamics: EnsembleDynamics,
     optimizer: torch.optim.Optimizer,
     persistent_buffer: PersistentReplayBuffer,
+    device: torch.device,
     n_passes: int = REHEARSAL_PASSES,
     batch_size: int = REHEARSAL_BATCH,
 ) -> float:
     """Train encoder + dynamics on accumulated dataset."""
-    import torch.nn.functional as F
-    from remash.world_model.ensemble_model import TARGET_TAU
-
-    device = next(encoder.parameters()).device
-    # Create a target encoder for stable targets
-    target_encoder = SpatialEncoder().to(device)
-    target_encoder.load_state_dict(encoder.state_dict())
-
     total_loss = 0.0
     n_batches = 0
 
@@ -166,7 +142,6 @@ def offline_rehearsal(
         )
         optimizer.step()
 
-        # Polyak update
         with torch.no_grad():
             for p, tp in zip(encoder.parameters(), target_encoder.parameters()):
                 tp.data.mul_(TARGET_TAU).add_(p.data, alpha=1 - TARGET_TAU)
@@ -181,39 +156,42 @@ def main():
     parser = argparse.ArgumentParser(description="Pre-train world model on public games")
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--max-steps", type=int, default=2000)
-    parser.add_argument("--validate", action="store_true", help="Run benchmark after pre-training")
-    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
     setup_logging(level=logging.WARNING)
-
     WEIGHTS_DIR.mkdir(exist_ok=True)
 
     arcade = arc_agi.Arcade()
     all_envs = arcade.get_environments()
-    train_games = [e.game_id for e in all_envs if e.game_id not in HOLDOUT_GAMES]
+    train_games = [e.game_id for e in all_envs if e.game_id.split("-")[0] not in HOLDOUT_GAMES]
     print(f"Training games: {len(train_games)}, Hold-out: {len(HOLDOUT_GAMES)}")
 
-    # Shared encoder + dynamics (persist across episodes)
     device = torch.device("cpu")
-    encoder = SpatialEncoder().to(device)
-    dynamics = EnsembleDynamics().to(device)
-    optimizer = torch.optim.Adam(
-        list(encoder.parameters()) + list(dynamics.parameters()),
+
+    # Shared encoder + dynamics
+    shared_encoder = SpatialEncoder().to(device)
+    shared_target_encoder = SpatialEncoder().to(device)
+    shared_dynamics = EnsembleDynamics().to(device)
+    shared_target_encoder.load_state_dict(shared_encoder.state_dict())
+
+    shared_optimizer = torch.optim.Adam(
+        list(shared_encoder.parameters()) + list(shared_dynamics.parameters()),
         lr=LEARNING_RATE,
     )
 
     if args.resume and CHECKPOINT_PATH.exists():
-        ckpt = torch.load(CHECKPOINT_PATH, map_location=device)
-        encoder.load_state_dict(ckpt["encoder"])
-        dynamics.load_state_dict(ckpt["dynamics"])
-        print(f"Resumed from {CHECKPOINT_PATH}")
+        ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=True)
+        shared_encoder.load_state_dict(ckpt["encoder"])
+        shared_dynamics.load_state_dict(ckpt["dynamics"])
+        shared_target_encoder.load_state_dict(ckpt["encoder"])
+        print(f"Resumed from {CHECKPOINT_PATH} (episode {ckpt.get('episode', '?')})")
 
     persistent_buffer = PersistentReplayBuffer()
 
     print(f"\nPre-training {args.episodes} episodes...")
-    print(f"{'Ep':>4} {'Game':<15} {'Levels':>6} {'Steps':>6} {'Loss':>8} {'Replay':>7} {'Time':>6}")
-    print("-" * 60)
+    print(f"{'Ep':>4} {'Game':<15} {'Lvl':>5} {'Steps':>6} {'Loss':>8} {'Buf':>7} {'Time':>6}")
+    print("-" * 58)
 
     t0 = time.time()
 
@@ -225,67 +203,72 @@ def main():
         if env is None:
             continue
 
-        # Create fresh agent with augmented world model
-        available_actions = [GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3,
-                             GameAction.ACTION4, GameAction.ACTION5, GameAction.ACTION6,
-                             GameAction.ACTION7]
-        graph = StateGraph(available_actions=available_actions)
-        wm = AugmentedWorldModel(graph, color_perm)
+        # Create fresh graph and augmented world model with shared weights
+        graph = StateGraph()
+        wm = AugmentedEnsembleWorldModel(graph, color_perm)
 
-        # Inject shared weights
-        wm.encoder.load_state_dict(encoder.state_dict())
-        wm.target_encoder.load_state_dict(encoder.state_dict())
-        wm.dynamics.load_state_dict(dynamics.state_dict())
+        # Copy shared weights into the episode's world model
+        wm.encoder.load_state_dict(shared_encoder.state_dict())
+        wm.target_encoder.load_state_dict(shared_target_encoder.state_dict())
+        wm.dynamics.load_state_dict(shared_dynamics.state_dict())
         wm.optimizer = torch.optim.Adam(
             list(wm.encoder.parameters()) + list(wm.dynamics.parameters()),
             lr=LEARNING_RATE,
         )
 
         policy = ExplorerPolicy()
-        agent = ReMashAgent(policy=policy, use_neural=False, max_total_steps=args.max_steps)
+        agent = ReMashAgent(policy=policy, max_total_steps=args.max_steps)
 
         ep_t0 = time.time()
-        # Manually override world model
-        result = agent.play_game(env, game_id=game_id, competition_mode=True)
-        # Note: play_game creates its own world model. We need to hook in differently.
-        # For now, just run the agent and collect the replay data from the standard path.
+        result = agent.play_game(
+            env, game_id=game_id,
+            competition_mode=True,
+            external_world_model=wm,
+        )
         ep_time = time.time() - ep_t0
 
-        # The agent's world model trained during the episode.
-        # We can't easily extract it since play_game creates it internally.
-        # TODO: refactor to accept external world model
+        # Copy trained weights back to shared model
+        shared_encoder.load_state_dict(wm.encoder.state_dict())
+        shared_target_encoder.load_state_dict(wm.target_encoder.state_dict())
+        shared_dynamics.load_state_dict(wm.dynamics.state_dict())
 
-        print(f"{ep+1:4d} {game_id:<15} {result.levels_completed:>2}/{result.win_levels:<3}"
-              f" {result.total_steps:>6} {'N/A':>8} {len(persistent_buffer):>7} {ep_time:>5.1f}s")
+        # Accumulate replay transitions
+        added = persistent_buffer.extend_from(wm.replay)
+
+        print(
+            f"{ep+1:4d} {game_id:<15} {result.levels_completed:>2}/{result.win_levels:<3}"
+            f" {result.total_steps:>6} {wm.avg_loss:>8.5f} {len(persistent_buffer):>7} {ep_time:>5.1f}s"
+        )
 
         # Offline rehearsal every N episodes
         if (ep + 1) % REHEARSAL_EVERY == 0 and len(persistent_buffer) > 100:
-            loss = offline_rehearsal(encoder, dynamics, optimizer, persistent_buffer)
+            loss = offline_rehearsal(
+                shared_encoder, shared_target_encoder, shared_dynamics,
+                shared_optimizer, persistent_buffer, device,
+            )
             print(f"     [rehearsal] loss={loss:.6f} buffer={len(persistent_buffer)}")
 
-        # Save checkpoint periodically
+        # Checkpoint periodically
         if (ep + 1) % 25 == 0:
             torch.save({
-                "encoder": encoder.state_dict(),
-                "dynamics": dynamics.state_dict(),
+                "encoder": shared_encoder.state_dict(),
+                "dynamics": shared_dynamics.state_dict(),
                 "episode": ep + 1,
             }, CHECKPOINT_PATH)
             print(f"     [checkpoint] saved to {CHECKPOINT_PATH}")
 
     elapsed = time.time() - t0
-    print(f"\nPre-training complete: {args.episodes} episodes in {elapsed:.0f}s")
 
     # Final save
     torch.save({
-        "encoder": encoder.state_dict(),
-        "dynamics": dynamics.state_dict(),
+        "encoder": shared_encoder.state_dict(),
+        "dynamics": shared_dynamics.state_dict(),
         "episode": args.episodes,
     }, CHECKPOINT_PATH)
-    print(f"Saved weights to {CHECKPOINT_PATH}")
 
-    if args.validate:
-        print("\nRunning validation benchmark...")
-        os.system("uv run python scripts/benchmark.py --efe --competition-mode --pretrained")
+    print(f"\nPre-training complete: {args.episodes} episodes in {elapsed:.0f}s ({elapsed/60:.1f}m)")
+    print(f"Final buffer: {len(persistent_buffer)} transitions")
+    print(f"Saved weights to {CHECKPOINT_PATH}")
 
 
 if __name__ == "__main__":
