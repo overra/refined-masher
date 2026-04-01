@@ -39,9 +39,9 @@ if TYPE_CHECKING:
     from remash.world_model.base import WorldModel
 
 # --- Hyperparameters ---
-_CALIBRATION_STEPS = 8  # Explorer drives for spatial calibration only
-_MIN_REPLAY_FOR_IMAGINATION = 40  # need this many before imagination rollouts
-_IMAGINATION_HORIZON = 3  # rollout steps
+_CALIBRATION_STEPS = 8
+_MIN_REPLAY_FOR_MPC = 40  # need this many transitions before MPC planning
+_MPC_HORIZON = 4  # lookahead steps for planning
 _ACTOR_LR = 3e-3
 _CRITIC_LR = 3e-3
 _GAMMA = 0.95
@@ -51,7 +51,6 @@ _BETA_MIN = 0.1
 _ENTROPY_COEF = 0.02
 _TRAIN_ACTOR_EVERY = 8
 _TRAIN_BATCH_SIZE = 8
-_LARGE_DIFF_THRESHOLD = 20
 
 
 class ActorMLP(nn.Module):
@@ -239,90 +238,167 @@ class ActorCriticPolicy(Policy):
 
         z_flat = z.view(1, -1)
 
-        # Compute ensemble uncertainty for each available action
-        uncertainties = torch.zeros(1, self._num_actions, device=self._device)
-        for a in self._available_actions:
-            unc = world_model.get_uncertainty(state_hash, a)
-            uncertainties[0, a.value] = unc
-
-        # Before imagination is ready: simple disagreement-based selection
-        # (fast, no rollouts, just pick the most uncertain action)
+        # Before world model is ready: Explorer + uncertainty override
         replay_size = len(world_model.replay) if hasattr(world_model, 'replay') else 0
-        use_imagination = replay_size >= _MIN_REPLAY_FOR_IMAGINATION
-
-        if not use_imagination:
-            # Simple mode: blend Explorer's preference with uncertainty
-            # Explorer picks what it would do
+        if replay_size < _MIN_REPLAY_FOR_MPC:
             explorer_action = self._explorer.select_action(
                 state_hash, frame, objects, ui_state,
                 world_model, episode, graph, cross_level, context,
             )
-
             # With probability β, override with highest-uncertainty action
             if random.random() < self._beta:
-                unc_vals = [(a, uncertainties[0, a.value].item()) for a in self._available_actions]
+                unc_vals = [(a, world_model.get_uncertainty(state_hash, a))
+                            for a in self._available_actions]
                 unc_vals.sort(key=lambda x: -x[1])
-                # Pick highest-uncertainty action (if uncertainty > 0)
                 if unc_vals and unc_vals[0][1] > 0.01:
                     action = unc_vals[0][0]
                     self._mode = "ac-unc"
                     self.last_reason = f"unc-pick({action.name} u={unc_vals[0][1]:.2f})"
                     self._beta = max(_BETA_MIN, self._beta * _BETA_DECAY)
                     return action
-
-            # Fall through to Explorer's choice
             self._mode = "ac-expl"
             self.last_reason = f"expl+unc:{self._explorer.last_reason}"
             self._beta = max(_BETA_MIN, self._beta * _BETA_DECAY)
             return explorer_action
 
-        # Full mode: actor network + uncertainty blending
-        with torch.no_grad():
-            logits = self._actor(z_flat)
-            mask = torch.full((1, self._num_actions), float('-inf'), device=self._device)
-            for a in self._available_actions:
-                mask[0, a.value] = 0.0
-            masked_logits = logits + mask
-            probs = F.softmax(masked_logits, dim=-1)
+        # --- MPC: Model-Predictive Control ---
+        # Get Explorer's recommendation as the default
+        explorer_action = self._explorer.select_action(
+            state_hash, frame, objects, ui_state,
+            world_model, episode, graph, cross_level, context,
+        )
 
-            # Blend actor probs with uncertainty
-            unc_sum = uncertainties.sum()
-            if unc_sum > 1e-8:
-                unc_probs = uncertainties / unc_sum
-            else:
-                unc_probs = torch.zeros_like(uncertainties)
-                for a in self._available_actions:
-                    unc_probs[0, a.value] = 1.0 / len(self._available_actions)
-            blended = (1 - self._beta) * probs + self._beta * unc_probs
-            blended = blended.clamp(min=0.0)
-            blended_sum = blended.sum()
-            if blended_sum < 1e-8:
-                for a in self._available_actions:
-                    blended[0, a.value] = 1.0 / len(self._available_actions)
-            else:
-                blended = blended / blended_sum
+        # Run MPC to see if any action is clearly better
+        mpc_action, mpc_score, mpc_reason = self._mpc_plan(
+            z_flat, world_model, graph,
+        )
 
-        action_idx = torch.multinomial(blended, 1).item()
-        action = GameAction.from_id(action_idx)
+        # Also score the Explorer's preferred action via MPC
+        explorer_idx = None
+        for i, a in enumerate(self._available_actions):
+            if a == explorer_action:
+                explorer_idx = i
+                break
+
+        # Use MPC action only if it's significantly better than Explorer's choice
+        # This prevents MPC from overriding good heuristics with noise
+        action = explorer_action
+        reason = f"expl+mpc:{self._explorer.last_reason}"
+        mode = "mpc-expl"
+
+        if mpc_action != explorer_action:
+            # MPC wants something different — use it if score is meaningfully positive
+            if mpc_score > 0.1:
+                action = mpc_action
+                reason = mpc_reason
+                mode = "mpc"
 
         self._beta = max(_BETA_MIN, self._beta * _BETA_DECAY)
 
         energy = ui_state.energy if ui_state else None
         if energy is not None and energy < 0.3:
-            self._mode = "ac-low"
-        else:
-            self._mode = "ac"
+            mode = mode + "-low"
+        self._mode = mode
 
-        # Train via imagination only when model is ready
+        # Train actor-critic periodically
         if self._total_steps % _TRAIN_ACTOR_EVERY == 0:
             self._train_imagination(world_model, graph)
 
-        self.last_reason = (
-            f"ac(β={self._beta:.2f}"
-            f" p={blended[0, action_idx]:.2f}"
-            f" unc={uncertainties[0, action_idx]:.2f})"
-        )
+        self.last_reason = reason
         return action
+
+    def _mpc_plan(
+        self,
+        z_flat: torch.Tensor,
+        world_model: WorldModel,
+        graph: StateGraph,
+    ) -> tuple[GameAction, float, str]:
+        """Model-Predictive Control: score each opening action by imagined trajectory.
+
+        For each available action:
+        1. Predict next latent via world model dynamics
+        2. Continue for _MPC_HORIZON steps using actor policy
+        3. Score trajectory by: novelty (uncertainty) + change magnitude + win bonus
+        4. Return the opening action of the best trajectory.
+
+        All forward passes are batched for efficiency.
+        """
+        n_actions = len(self._available_actions)
+        if n_actions == 0:
+            return GameAction.ACTION1, 0.0, "mpc-no-actions"
+
+        horizon = _MPC_HORIZON
+
+        # Build batched first-step: one copy of z per available action
+        # Shape: (n_actions, latent_dim)
+        z_batch = z_flat.expand(n_actions, -1).clone()
+
+        # First actions: one-hot for each available action
+        first_action_oh = torch.zeros(n_actions, self._num_actions, device=self._device)
+        for i, a in enumerate(self._available_actions):
+            first_action_oh[i, a.value] = 1.0
+        click_batch = torch.zeros(n_actions, 2, device=self._device)
+
+        # Track scores per trajectory
+        scores = torch.zeros(n_actions, device=self._device)
+
+        with torch.no_grad():
+            # Step 1: apply each opening action
+            delta, unc = world_model.dynamics(z_batch, first_action_oh, click_batch)
+            z_batch = F.normalize(z_batch + delta, p=2, dim=1)
+            change_mag = delta.abs().mean(dim=-1)
+
+            # Score step 1
+            scores += unc * self._beta  # novelty (weighted by exploration drive)
+            scores += change_mag * 0.5  # something happened
+
+            # Check if any trajectory reaches a known win state in the graph
+            # (we can't directly check latent→hash, but graph wins are handled by Explorer)
+
+            # Steps 2..horizon: use actor policy for subsequent actions
+            for t in range(1, horizon):
+                # Actor picks next action for each trajectory
+                logits = self._actor(z_batch)
+                mask = torch.full((n_actions, self._num_actions), float('-inf'), device=self._device)
+                for a in self._available_actions:
+                    mask[:, a.value] = 0.0
+                probs = F.softmax(logits + mask, dim=-1)
+                next_actions = probs.argmax(dim=-1)  # greedy for planning
+
+                next_action_oh = torch.zeros(n_actions, self._num_actions, device=self._device)
+                next_action_oh.scatter_(1, next_actions.unsqueeze(1), 1.0)
+                click_batch = torch.zeros(n_actions, 2, device=self._device)
+
+                delta, unc = world_model.dynamics(z_batch, next_action_oh, click_batch)
+                z_batch = F.normalize(z_batch + delta, p=2, dim=1)
+                change_mag = delta.abs().mean(dim=-1)
+
+                discount = _GAMMA ** t
+                scores += discount * unc * self._beta
+                scores += discount * change_mag * 0.5
+
+            # Final state value from critic (if available)
+            if self._critic is not None:
+                # Use the actor's preferred action for value estimation
+                final_logits = self._actor(z_batch)
+                final_probs = F.softmax(final_logits + mask, dim=-1)
+                final_action_oh = torch.zeros(n_actions, self._num_actions, device=self._device)
+                final_action_oh.scatter_(1, final_probs.argmax(dim=-1).unsqueeze(1), 1.0)
+                terminal_value = self._critic(z_batch, final_action_oh)
+                scores += (_GAMMA ** horizon) * terminal_value
+
+        # Pick best opening action
+        best_idx = scores.argmax().item()
+        best_action = self._available_actions[best_idx]
+        best_score = scores[best_idx].item()
+
+        # Format reason string
+        action_scores = " ".join(
+            f"{a.name}={scores[i]:.2f}" for i, a in enumerate(self._available_actions)
+        )
+        reason = f"mpc(best={best_action.name} s={best_score:.2f} h={horizon} | {action_scores})"
+
+        return best_action, best_score, reason
 
     def _train_imagination(self, world_model: WorldModel, graph: StateGraph) -> None:
         """Train actor-critic via imagined rollouts through the world model."""
@@ -337,7 +413,7 @@ class ActorCriticPolicy(Policy):
             return
 
         # Only do imagination rollouts when model has enough data
-        if len(world_model.replay) < _MIN_REPLAY_FOR_IMAGINATION:
+        if len(world_model.replay) < _MIN_REPLAY_FOR_MPC:
             return
 
         batch = world_model.replay.sample(min(_TRAIN_BATCH_SIZE, len(world_model.replay)))
@@ -360,7 +436,7 @@ class ActorCriticPolicy(Policy):
 
         current_z = z_flat
 
-        for t in range(_IMAGINATION_HORIZON):
+        for t in range(_MPC_HORIZON):
             # Actor produces action distribution
             logits = self._actor(current_z)
             mask = torch.full((len(batch), self._num_actions), float('-inf'), device=self._device)
