@@ -27,6 +27,8 @@ def main() -> None:
     parser.add_argument("--competition-mode", action="store_true",
                         help="Multi-life mode: GAME_OVER triggers RESET, not exit. "
                              "Matches actual competition behavior.")
+    parser.add_argument("--pretrained", action="store_true",
+                        help="Load pre-trained encoder/dynamics from weights/pretrained.pt")
     args = parser.parse_args()
 
     setup_logging(level=logging.DEBUG if args.verbose else logging.WARNING)
