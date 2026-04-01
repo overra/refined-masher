@@ -344,13 +344,14 @@ class ActorCriticPolicy(Policy):
         if not batch:
             return
 
-        # Encode starting frames
+        # Encode starting frames (one-hot, L2-normalized)
         import numpy as np
-        frames = np.stack([t[0] for t in batch]).astype(np.float32) / 15.0
-        frames_t = torch.from_numpy(frames).unsqueeze(1).to(self._device)
+        from remash.world_model.ensemble_model import batch_grids_to_onehot
+        frames = np.stack([t[0] for t in batch])
+        frames_t = batch_grids_to_onehot(frames).to(self._device)
         with torch.no_grad():
-            z = world_model.encoder(frames_t)  # (batch, C, 8, 8)
-        z_flat = z.view(len(batch), -1)
+            z = world_model.encoder(frames_t)
+            z_flat = F.normalize(z.view(len(batch), -1), p=2, dim=1)
 
         # Imagined rollout
         total_actor_loss = torch.tensor(0.0, device=self._device)
