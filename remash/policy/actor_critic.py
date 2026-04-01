@@ -39,18 +39,19 @@ if TYPE_CHECKING:
     from remash.world_model.base import WorldModel
 
 # --- Hyperparameters ---
-_BOOTSTRAP_STEPS = 15  # use Explorer for this many steps per level
-_MIN_REPLAY_FOR_AC = 30  # need this many transitions before AC training
-_IMAGINATION_HORIZON = 5  # rollout steps for imagined training
-_ACTOR_LR = 1e-3
-_CRITIC_LR = 1e-3
-_GAMMA = 0.95  # discount factor
-_BETA_INIT = 1.0  # initial intrinsic reward weight
-_BETA_DECAY = 0.995  # per-step decay of intrinsic reward weight
-_BETA_MIN = 0.1  # minimum intrinsic weight (always some curiosity)
-_ENTROPY_COEF = 0.01  # entropy regularization for actor
-_TRAIN_ACTOR_EVERY = 4  # train actor-critic every N steps
-_LARGE_DIFF_THRESHOLD = 20  # extrinsic reward for diffs above this
+_CALIBRATION_STEPS = 8  # Explorer drives for spatial calibration only
+_MIN_REPLAY_FOR_IMAGINATION = 40  # need this many before imagination rollouts
+_IMAGINATION_HORIZON = 3  # rollout steps
+_ACTOR_LR = 3e-3
+_CRITIC_LR = 3e-3
+_GAMMA = 0.95
+_BETA_INIT = 0.8
+_BETA_DECAY = 0.99
+_BETA_MIN = 0.1
+_ENTROPY_COEF = 0.02
+_TRAIN_ACTOR_EVERY = 8
+_TRAIN_BATCH_SIZE = 8
+_LARGE_DIFF_THRESHOLD = 20
 
 
 class ActorMLP(nn.Module):
@@ -197,17 +198,6 @@ class ActorCriticPolicy(Policy):
             self.last_reason = self._explorer.last_reason
             return action
 
-        # Bootstrap phase: let Explorer calibrate and gather initial data
-        if self._level_steps <= _BOOTSTRAP_STEPS:
-            self._using_explorer = True
-            self._mode = "bootstrap"
-            action = self._explorer.select_action(
-                state_hash, frame, objects, ui_state,
-                world_model, episode, graph, cross_level, context,
-            )
-            self.last_reason = f"boot:{self._explorer.last_reason}"
-            return action
-
         # Always defer to Explorer for known win paths
         win_path = graph.get_path_to_win(state_hash)
         if win_path:
@@ -220,15 +210,16 @@ class ActorCriticPolicy(Policy):
             self.last_reason = f"win:{self._explorer.last_reason}"
             return action
 
-        # Not enough data yet — keep exploring
-        if hasattr(world_model, 'replay') and len(world_model.replay) < _MIN_REPLAY_FOR_AC:
+        # Phase 1: Explorer drives for spatial calibration (first 8 steps)
+        # The world model is already training from Explorer's actions
+        if self._level_steps <= _CALIBRATION_STEPS:
             self._using_explorer = True
-            self._mode = "gathering"
+            self._mode = "calibrate"
             action = self._explorer.select_action(
                 state_hash, frame, objects, ui_state,
                 world_model, episode, graph, cross_level, context,
             )
-            self.last_reason = f"gather:{self._explorer.last_reason}"
+            self.last_reason = f"cal:{self._explorer.last_reason}"
             return action
 
         # --- Actor-Critic action selection ---
@@ -238,7 +229,6 @@ class ActorCriticPolicy(Policy):
         # Get latent for current state
         z = world_model._get_latent(state_hash)
         if z is None:
-            # Can't encode — fall back to Explorer
             self._using_explorer = True
             action = self._explorer.select_action(
                 state_hash, frame, objects, ui_state,
@@ -249,62 +239,81 @@ class ActorCriticPolicy(Policy):
 
         z_flat = z.view(1, -1)
 
-        # Compute action probabilities from actor
+        # Compute ensemble uncertainty for each available action
+        uncertainties = torch.zeros(1, self._num_actions, device=self._device)
+        for a in self._available_actions:
+            unc = world_model.get_uncertainty(state_hash, a)
+            uncertainties[0, a.value] = unc
+
+        # Before imagination is ready: simple disagreement-based selection
+        # (fast, no rollouts, just pick the most uncertain action)
+        replay_size = len(world_model.replay) if hasattr(world_model, 'replay') else 0
+        use_imagination = replay_size >= _MIN_REPLAY_FOR_IMAGINATION
+
+        if not use_imagination:
+            # Simple mode: blend Explorer's preference with uncertainty
+            # Explorer picks what it would do
+            explorer_action = self._explorer.select_action(
+                state_hash, frame, objects, ui_state,
+                world_model, episode, graph, cross_level, context,
+            )
+
+            # With probability β, override with highest-uncertainty action
+            if random.random() < self._beta:
+                unc_vals = [(a, uncertainties[0, a.value].item()) for a in self._available_actions]
+                unc_vals.sort(key=lambda x: -x[1])
+                # Pick highest-uncertainty action (if uncertainty > 0)
+                if unc_vals and unc_vals[0][1] > 0.01:
+                    action = unc_vals[0][0]
+                    self._mode = "ac-unc"
+                    self.last_reason = f"unc-pick({action.name} u={unc_vals[0][1]:.2f})"
+                    self._beta = max(_BETA_MIN, self._beta * _BETA_DECAY)
+                    return action
+
+            # Fall through to Explorer's choice
+            self._mode = "ac-expl"
+            self.last_reason = f"expl+unc:{self._explorer.last_reason}"
+            self._beta = max(_BETA_MIN, self._beta * _BETA_DECAY)
+            return explorer_action
+
+        # Full mode: actor network + uncertainty blending
         with torch.no_grad():
             logits = self._actor(z_flat)
-            # Mask unavailable actions
             mask = torch.full((1, self._num_actions), float('-inf'), device=self._device)
             for a in self._available_actions:
                 mask[0, a.value] = 0.0
             masked_logits = logits + mask
             probs = F.softmax(masked_logits, dim=-1)
 
-            # Add exploration bonus: boost actions with high ensemble uncertainty
-            uncertainties = torch.zeros(1, self._num_actions, device=self._device)
-            for a in self._available_actions:
-                unc = world_model.get_uncertainty(state_hash, a)
-                uncertainties[0, a.value] = unc
-
-            # Blend: (1-β) * actor_probs + β * uncertainty_probs
+            # Blend actor probs with uncertainty
             unc_sum = uncertainties.sum()
             if unc_sum > 1e-8:
                 unc_probs = uncertainties / unc_sum
             else:
-                # All uncertainties zero (all known) — uniform over available
                 unc_probs = torch.zeros_like(uncertainties)
                 for a in self._available_actions:
                     unc_probs[0, a.value] = 1.0 / len(self._available_actions)
             blended = (1 - self._beta) * probs + self._beta * unc_probs
-            # Ensure valid distribution
             blended = blended.clamp(min=0.0)
             blended_sum = blended.sum()
             if blended_sum < 1e-8:
-                # Fallback: uniform over available actions
                 for a in self._available_actions:
                     blended[0, a.value] = 1.0 / len(self._available_actions)
             else:
                 blended = blended / blended_sum
 
-        # Sample action
         action_idx = torch.multinomial(blended, 1).item()
         action = GameAction.from_id(action_idx)
 
-        # For click actions, delegate target selection to ClickTargetManager
-        # (it already tracks responsive positions and cycles targets)
-
-        # Decay β
         self._beta = max(_BETA_MIN, self._beta * _BETA_DECAY)
 
-        # Energy-aware mode label
         energy = ui_state.energy if ui_state else None
         if energy is not None and energy < 0.3:
             self._mode = "ac-low"
-        elif self._beta > 0.5:
-            self._mode = "ac-expl"
         else:
-            self._mode = "ac-expl" if self._beta > 0.3 else "ac"
+            self._mode = "ac"
 
-        # Train periodically via imagined rollouts
+        # Train via imagination only when model is ready
         if self._total_steps % _TRAIN_ACTOR_EVERY == 0:
             self._train_imagination(world_model, graph)
 
@@ -327,11 +336,11 @@ class ActorCriticPolicy(Policy):
         except ImportError:
             return
 
-        # Sample a batch of starting states from the replay buffer
-        if len(world_model.replay) < _MIN_REPLAY_FOR_AC:
+        # Only do imagination rollouts when model has enough data
+        if len(world_model.replay) < _MIN_REPLAY_FOR_IMAGINATION:
             return
 
-        batch = world_model.replay.sample(min(16, len(world_model.replay)))
+        batch = world_model.replay.sample(min(_TRAIN_BATCH_SIZE, len(world_model.replay)))
         if not batch:
             return
 
@@ -387,14 +396,14 @@ class ActorCriticPolicy(Policy):
             # Critic value estimates
             v_current = self._critic(current_z.detach(), action_oh)
             with torch.no_grad():
-                # Bootstrap value of next state (max over actions)
-                best_v_next = torch.full((len(batch),), 0.0, device=self._device)
-                for a in self._available_actions:
-                    a_oh = torch.zeros(len(batch), self._num_actions, device=self._device)
-                    a_oh[:, a.value] = 1.0
-                    v_a = self._critic(next_z, a_oh)
-                    best_v_next = torch.max(best_v_next, v_a)
-                target = reward + _GAMMA * best_v_next
+                # Bootstrap: use the actor's own preferred action for V(s')
+                next_logits = self._actor(next_z)
+                next_probs = F.softmax(next_logits, dim=-1)
+                next_action_oh = torch.zeros(len(batch), self._num_actions, device=self._device)
+                next_action_idx = next_probs.argmax(dim=-1)
+                next_action_oh.scatter_(1, next_action_idx.unsqueeze(1), 1.0)
+                v_next = self._critic(next_z, next_action_oh)
+                target = reward + _GAMMA * v_next
 
             # Critic loss: MSE to TD target
             critic_loss = F.mse_loss(v_current, target)
