@@ -68,10 +68,12 @@ def main() -> None:
             use_neural = False
 
         try:
+            pretrained = "weights/pretrained.pt" if args.pretrained else None
             agent = ReMashAgent(
                 policy=policy,
                 use_neural=use_neural,
                 max_total_steps=args.max_steps,
+                pretrained_path=pretrained,
             )
             result = agent.play_game(
                 env, game_id=game_id,

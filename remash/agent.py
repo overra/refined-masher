@@ -230,10 +230,12 @@ class ClickTargetManager:
 
 
 class ReMashAgent:
-    def __init__(self, policy: Policy, max_total_steps: int = 2000, use_neural: bool = False) -> None:
+    def __init__(self, policy: Policy, max_total_steps: int = 2000,
+                 use_neural: bool = False, pretrained_path: str | None = None) -> None:
         self.policy = policy
         self.max_total_steps = max_total_steps
         self.use_neural = use_neural
+        self.pretrained_path = pretrained_path
 
     def play_game(self, env, game_id: str = "", competition_mode: bool = False,
                    external_world_model: WorldModel | None = None) -> GameResult:
@@ -270,8 +272,11 @@ class ReMashAgent:
                 world_model.graph = graph
             logger.info("Using external world model")
         elif self.use_neural and EnsembleWorldModel is not None:
-            world_model = EnsembleWorldModel(graph)
-            logger.info("Using ensemble world model (residual MLP)")
+            world_model = EnsembleWorldModel(graph, pretrained_path=self.pretrained_path)
+            if self.pretrained_path:
+                logger.info("Using ensemble world model (pretrained from %s)", self.pretrained_path)
+            else:
+                logger.info("Using ensemble world model (residual MLP)")
         elif self.use_neural and NeuralWorldModel is not None:
             world_model = NeuralWorldModel(graph)
             logger.info("Using neural world model (CfC ensemble)")
